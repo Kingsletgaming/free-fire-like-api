@@ -1,11 +1,11 @@
 from flask import Flask, request, jsonify
-import asyncio, json, binascii, requests, aiohttp, urllib3
+import asyncio, json, binascii, requests, aiohttp, urllib3, time
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf.json_format import MessageToJson
 from google.protobuf.message import DecodeError
 import like_pb2, like_count_pb2, uid_generator_pb2
-from config import URLS_INFO ,URLS_LIKE,FILES
+from config import URLS_INFO, URLS_LIKE, FILES
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 
@@ -39,62 +39,91 @@ def create_uid(uid):
     return m.SerializeToString()
 
 async def send(token, url, data):
-    headers =get_headers(token)
+    headers = get_headers(token)
     async with aiohttp.ClientSession() as s:
-        async with s.post(url, data=bytes.fromhex(data), headers=headers) as r: return await r.text() if r.status==200 else None
-
-async def multi(uid, server, url):
-    enc = encrypt_message(create_like(uid, server))
-    tokens = load_tokens(server)
-    return await asyncio.gather(*[send(tokens[i%len(tokens)]['token'], url, enc) for i in range(105)])
+        async with s.post(url, data=bytes.fromhex(data), headers=headers) as r:
+            text = await r.text()
+            if r.status == 200:
+                return text  # Success (usually empty or "OK")
+            else:
+                print(f"Error {r.status} for token {token[:20]}...: {text}")  # Log error
+                return None
 
 def get_info(enc, server, token):
-    urls =URLS_INFO
+    urls = URLS_INFO
     r = requests.post(urls.get(server,"https://clientbp.ggblueshark.com/GetPlayerPersonalShow"),
                       data=bytes.fromhex(enc), headers=get_headers(token), verify=False)
-    try: p = like_count_pb2.Info(); p.ParseFromString(r.content); return p
-    except DecodeError: return None
+    try: 
+        p = like_count_pb2.Info(); 
+        p.ParseFromString(r.content); 
+        return p
+    except DecodeError: 
+        return None
+
+async def multi(uid, server, url, max_attempts=100, batch_size=20):
+    enc = encrypt_message(create_like(uid, server))
+    tokens = load_tokens(server)
+    if not tokens:
+        return 0
+    added = 0
+    for i in range(0, max_attempts, batch_size):
+        if added >= max_attempts:
+            break
+        batch_tokens = [tokens[j % len(tokens)]['token'] for j in range(i, min(i + batch_size, max_attempts))]
+        batch_results = await asyncio.gather(*[send(t, url, enc) for t in batch_tokens])
+        successes = sum(1 for res in batch_results if res is not None)
+        added += successes
+        time.sleep(1)  # Throttle to avoid rate limits
+    return added
 
 @app.route("/like")
 def like():
     uid, server = request.args.get("uid"), request.args.get("server","").upper()
-    if not uid or not server: return jsonify(error="UID and server required"),400
-    tokens = load_tokens(server); enc = encrypt_message(create_uid(uid))
+    if not uid or not server: 
+        return jsonify(error="UID and server required"),400
+    tokens = load_tokens(server)
+    if not tokens: 
+        return jsonify(error="No tokens available"),500
+    enc_uid = encrypt_message(create_uid(uid))
+
+    # Get initial count
     before, tok = None, None
     for t in tokens[:10]:
-        before = get_info(enc, server, t["token"])
-        if before: tok = t["token"]; break
-    if not before: return jsonify(error="Player not found"),500
+        before = get_info(enc_uid, server, t["token"])
+        if before: 
+            tok = t["token"]; 
+            break
+    if not before: 
+        return jsonify(error="Player not found"),500
     before_like = int(json.loads(MessageToJson(before)).get('AccountInfo',{}).get('Likes',0))
-    urls =URLS_LIKE
-    asyncio.run(multi(uid, server, urls.get(server,"https://clientbp.ggblueshark.com/LikeProfile")))
-    after = json.loads(MessageToJson(get_info(enc, server, tok)))
+    
+    # Estimate remaining slots (daily reset is 100)
+    remaining = 100 - (before_like % 100)
+    if remaining == 100:
+        remaining = 100  # Full day available
+
+    urls = URLS_LIKE
+    like_url = urls.get(server,"https://clientbp.ggblueshark.com/LikeProfile")
+    asyncio.run(multi(uid, server, like_url, remaining))
+    
+    # Get after count
+    after_proto = get_info(enc_uid, server, tok)
+    if not after_proto:
+        return jsonify(error="Failed to fetch after info"),500
+    after = json.loads(MessageToJson(after_proto))
     after_like = int(after.get('AccountInfo',{}).get('Likes',0))
+    actual_added = after_like - before_like
+
     return jsonify({
-        
-        
         "credits":"great.thug4ff.com",
-        "likes_added": after_like - before_like,
+        "likes_added": actual_added,
         "likes_before": before_like,
         "likes_after": after_like,
         "player": after.get('AccountInfo',{}).get('PlayerNickname',''),
         "uid": after.get('AccountInfo',{}).get('UID',0),
-        "status": 1 if after_like-before_like else 2,
-        
-       
+        "status": 1 if actual_added > 0 else 2,
+        "note": f"Max 100 new likes/day per UID. Attempted up to {remaining}, added {actual_added}."
     })
 
 if __name__ == "__main__":
     app.run(debug=True, use_reloader=False)
-
-
-
-
-
-
-
-
-
-    
-#URL_ENPOINTS ="http://127.0.0.1:5000/like?uid=13002831333&server=me"
-#credits : "https://great.thug4ff.com/"
